@@ -1,64 +1,71 @@
 import docker
 import os
 
-def run_in_sandbox(script_path: str) -> dict:
+def find_project_root(current_path: str, anchor: str = ".env") -> str:
+    dirname = os.path.abspath(current_path)
+    while True:
+        if os.path.exists(os.path.join(dirname, anchor)):
+            return dirname
+        parent = os.path.dirname(dirname)
+        if parent == dirname:
+            raise FileNotFoundError(f"Could not locate project root containing '{anchor}' anchor.")
+        dirname = parent
+
+def run_in_sandbox(target_file_path: str) -> dict:
     """
-    Spins up a secure, isolated Python container, runs the target script,
-    and returns the exit code and error logs.
+    Spins up an isolated Docker container, executes pytest, and guarantees
+    full extraction of test failure logs from stdout and stderr combined.
     """
-    # Initialize the Docker client from your local system
     client = docker.from_env()
     
-    # Get the absolute path to the directory containing our broken app
-    absolute_app_dir = os.path.abspath(os.path.dirname(script_path))
-    script_name = os.path.basename(script_path)
-    
-    print(f"📦 Mount directory: {absolute_app_dir}")
-    print(f"🧪 Running script: {script_name} inside container...")
-
     try:
-        # === UPDATED FOR WINDOWS COMPATIBILITY ===
-        container = client.containers.run(
+        root_dir = find_project_root(os.path.dirname(target_file_path))
+        target_dir = os.path.join(root_dir, "target_app")
+    except Exception as e:
+        return {"exit_code": -1, "logs": f"Path Discovery Error: {str(e)}"}
+    
+    # Force python to output streams unbuffered and run pytest explicitly
+    command_str = "python -m pip install pytest; python -m pytest tests/ --tb=short"
+    
+    try:
+        container_output = client.containers.run(
             image="python:3.11-slim",
-            command="python /app/app.py", 
+            command=f"sh -c '{command_str}'",
             volumes={
-                absolute_app_dir: {
-                    'bind': '/app',
-                    'mode': 'ro' 
+                target_dir: {
+                    'bind': '/workspace',
+                    'mode': 'rw'
                 }
             },
-            network_mode="none", 
-            detach=True
+            working_dir="/workspace",
+            network_mode="bridge",
+            environment={"PYTHONUNBUFFERED": "1"}, # Force immediate log flushing
+            detach=False,
+            stdout=True,
+            stderr=True
         )
-        # =========================================
-        
-        # Wait for the container to finish executing the code
-        result = container.wait()
-        exit_code = result["StatusCode"]
-        
-        # Fetch the console output (stdout and stderr combined)
-        logs = container.logs().decode("utf-8")
-        
-        # Clean up the container so we don't leave trash behind
-        container.remove()
         
         return {
-            "exit_code": exit_code,
-            "logs": logs
+            "exit_code": 0,
+            "logs": container_output.decode('utf-8')
         }
         
+    except docker.errors.ContainerError as e:
+        # Retrieve all historical logs directly from the physical container instance
+        raw_logs = e.container.logs(stdout=True, stderr=True).decode('utf-8')
+        
+        # Clean up the container from Docker's memory
+        try:
+            e.container.remove()
+        except:
+            pass
+            
+        return {
+            "exit_code": e.exit_status,
+            "logs": raw_logs if raw_logs.strip() else "Test failed but no logs were written to stdout/stderr."
+        }
     except Exception as e:
         return {
             "exit_code": -1,
-            "logs": f"Sandbox Execution Failed: {str(e)}"
+            "logs": f"Sandbox System Error: {str(e)}"
         }
-
-# --- TEST THE SANDBOX ---
-if __name__ == "__main__":
-    target = "./target_app/app.py"
-    output = run_in_sandbox(target)
-    
-    print("\n--- SANDBOX RESULTS ---")
-    print(f"Exit Code: {output['exit_code']} (0 means success, anything else means failure)")
-    print("Container Output logs:")
-    print(output['logs'])

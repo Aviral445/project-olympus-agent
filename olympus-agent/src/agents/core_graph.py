@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from typing import Dict, TypedDict, List
 from langgraph.graph import StateGraph, END
 from dotenv import load_dotenv
@@ -19,22 +20,45 @@ class AgentState(TypedDict):
     attempt_count: int
     history: List[str]
 
-# Initialize our verified Gemini model
-api_key = os.getenv("GEMINI_API_KEY")
-llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", google_api_key=api_key)
+# Pull the single primary key from our secure .env file
+API_KEY = os.getenv("GEMINI_API_KEY")
+
+def call_gemini_with_retry(prompt: str, max_retries: int = 3, initial_delay: int = 4) -> str:
+    """
+    Calls Gemini using a single API key. If the server is overloaded (503/429),
+    it applies an exponential backoff (waiting longer between each retry).
+    """
+    llm = ChatGoogleGenerativeAI(model="gemini-3.5-flash", google_api_key=API_KEY)
+    delay = initial_delay
+    
+    for attempt in range(max_retries):
+        try:
+            response = llm.invoke(prompt)
+            if isinstance(response.content, list):
+                return response.content[0].get("text", response.content).strip()
+            return response.content.strip()
+        except Exception as e:
+            error_msg = str(e)
+            # Catch temporary server overloads or rate limits
+            if "503" in error_msg or "429" in error_msg:
+                if attempt < max_retries - 1:
+                    print(f"\n⚠️ [Server Busy]: Gemini returned 503/429. Retrying in {delay}s (Attempt {attempt + 1}/{max_retries})...")
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+                    continue
+            raise e
 
 # 2. Define the Nodes
 def patch_agent(state: AgentState) -> Dict:
     current_attempts = state.get("attempt_count", 0) + 1
     print(f"\n🤖 [Patch Agent]: Analyzing bug and writing fix (Attempt #{current_attempts})...")
     
-    # FIX: Corrected path math to go backward two folders out of src/agents/ to hit target_app/
     target_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../target_app/app.py"))
     
+    # Read the broken file
     with open(target_file_path, "r") as f:
         current_code = f.read()
 
-    # Construct the instruction prompt for Gemini
     prompt = f"""
     You are an autonomous SRE agent. Your goal is to fix the following broken Python code.
     
@@ -47,18 +71,10 @@ def patch_agent(state: AgentState) -> Dict:
     {state['test_result']}
     """
     
-    # Call Gemini to get the code fix
-    response = llm.invoke(prompt)
-    
-    # Extract response text safely
-    if isinstance(response.content, list):
-        fixed_code = response.content[0].get("text", response.content)
-    else:
-        fixed_code = response.content
-        
-    fixed_code = fixed_code.strip()
+    # Call Gemini via our smart retry pipeline
+    fixed_code = call_gemini_with_retry(prompt)
 
-    # Physically write the AI's proposed fix into our target application folder!
+    # Physically write the AI's proposed fix into our target application folder
     with open(target_file_path, "w") as f:
         f.write(fixed_code)
     
@@ -73,7 +89,6 @@ def patch_agent(state: AgentState) -> Dict:
 def validation_agent(state: AgentState) -> Dict:
     print("🧪 [Validation Agent]: Spinning up Docker sandbox to test the application...")
     
-    # FIX: Corrected path math here as well to match patch_agent
     target_file_path = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../target_app/app.py"))
     sandbox_output = run_in_sandbox(target_file_path)
     
@@ -86,6 +101,8 @@ def validation_agent(state: AgentState) -> Dict:
     else:
         status = f"FAIL\n{logs}"
         print("❌ Sandbox execution failed with logs.")
+        # Add this line right here to display the diagnostic printout:
+        print(f"\n📊 [DIAGNOSTIC LOGS CAPTURED]:\n{logs}\n" + "-"*50)
         
     return {
         "test_result": status,
@@ -101,10 +118,8 @@ def human_intervention(state: AgentState) -> Dict:
 def should_continue(state: AgentState) -> str:
     if "PASS" in state["test_result"]:
         return END
-    
     if state["attempt_count"] >= 3:
         return "human_call"
-        
     return "try_again"
 
 # 4. Build the Graph
@@ -136,5 +151,5 @@ if __name__ == "__main__":
         "history": []
     }
     
-    print("Starting Fully Powered Project Olympus Agent...")
+    print("Starting Fully Powered Project Olympus Agent with Single Key Backoff Engine...")
     app.invoke(initial_state)
