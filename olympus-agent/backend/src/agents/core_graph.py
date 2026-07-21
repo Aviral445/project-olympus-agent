@@ -3,17 +3,23 @@ import os
 import re
 from typing import Dict, TypedDict, List
 from langgraph.graph import StateGraph, END
-from dotenv import load_dotenv
-from langchain_groq import ChatGroq
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
+from dotenv import load_dotenv, find_dotenv
 
-# Configure paths and load environment variables
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-load_dotenv(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../.env')))
+# Ensure backend/src is in sys.path dynamically
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+# Automatically locate and load .env regardless of working directory
+load_dotenv(find_dotenv(), override=True)
 
 from utils.sandbox import run_in_sandbox 
 from utils.git_manager import init_fix_branch, generate_patch_diff, commit_patch
+from utils.db import init_db, log_patch_run
+
+# Initialize Database on module load
+init_db()
 
 # 1. State Definition
 class AgentState(TypedDict):
@@ -23,10 +29,7 @@ class AgentState(TypedDict):
     attempt_count: int
     target_file: str
     history: List[str]
-
-GROQ_KEY = os.getenv("GROQ_API_KEY")
-OPENROUTER_KEY = os.getenv("OPENROUTER_API_KEY")
-GEMINI_KEY = os.getenv("GEMINI_API_KEY")
+    last_diff: str
 
 def clean_llm_code_output(raw_code: str) -> str:
     """Strips markdown code blocks from LLM responses."""
@@ -39,16 +42,21 @@ def clean_llm_code_output(raw_code: str) -> str:
 def invoke_llm_with_fallback(prompt: str) -> str:
     """
     Tier 1: Groq (llama-3.3-70b-versatile) - Blazing speed
-    Tier 2: OpenRouter (openrouter/auto or google/gemini-2.0-flash-001)
+    Tier 2: OpenRouter (openrouter/auto)
     Tier 3: Gemini Direct (gemini-2.0-flash)
     """
+    groq_key = os.getenv("GROQ_API_KEY")
+    openrouter_key = os.getenv("OPENROUTER_API_KEY")
+    gemini_key = os.getenv("GEMINI_API_KEY")
+
     # --- TIER 1: GROQ ---
-    if GROQ_KEY and not GROQ_KEY.startswith("your_"):
+    if groq_key and not groq_key.startswith("your_"):
         try:
             print("📡 [LLM Engine]: Requesting patch via Groq (llama-3.3-70b-versatile)...")
+            from langchain_groq import ChatGroq
             llm_groq = ChatGroq(
                 model="llama-3.3-70b-versatile",
-                groq_api_key=GROQ_KEY,
+                groq_api_key=groq_key,
                 temperature=0.1
             )
             response = llm_groq.invoke(prompt)
@@ -59,12 +67,13 @@ def invoke_llm_with_fallback(prompt: str) -> str:
             print("🔄 [LLM Engine]: Switching to Tier 2 (OpenRouter)...")
 
     # --- TIER 2: OPENROUTER ---
-    if OPENROUTER_KEY and not OPENROUTER_KEY.startswith("your_"):
+    if openrouter_key and not openrouter_key.startswith("your_"):
         try:
             print("📡 [LLM Engine]: Requesting patch via OpenRouter (openrouter/auto)...")
+            from langchain_openai import ChatOpenAI
             llm_openrouter = ChatOpenAI(
                 model="openrouter/auto",
-                openai_api_key=OPENROUTER_KEY,
+                openai_api_key=openrouter_key,
                 openai_api_base="[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)",
                 temperature=0.1
             )
@@ -76,12 +85,13 @@ def invoke_llm_with_fallback(prompt: str) -> str:
             print("🔄 [LLM Engine]: Switching to Tier 3 (Gemini Direct)...")
 
     # --- TIER 3: GEMINI DIRECT ---
-    if GEMINI_KEY and not GEMINI_KEY.startswith("your_"):
+    if gemini_key and not gemini_key.startswith("your_"):
         try:
             print("📡 [LLM Engine]: Requesting patch via Gemini Direct (gemini-2.0-flash)...")
+            from langchain_google_genai import ChatGoogleGenerativeAI
             llm_gemini = ChatGoogleGenerativeAI(
                 model="gemini-2.0-flash",
-                google_api_key=GEMINI_KEY
+                google_api_key=gemini_key
             )
             response = llm_gemini.invoke(prompt)
             content = response.content if isinstance(response.content, str) else response.content[0].get("text", "")
@@ -90,7 +100,7 @@ def invoke_llm_with_fallback(prompt: str) -> str:
             print(f"❌ [Gemini Direct Error]: {e}")
             raise e
 
-    raise RuntimeError("No operational LLM key found across Groq, OpenRouter, or Gemini.")
+    raise RuntimeError("No operational LLM key found across Groq, OpenRouter, or Gemini. Please verify your .env file.")
 
 # 2. Agent Nodes
 def patch_agent(state: AgentState) -> Dict:
@@ -140,6 +150,7 @@ def patch_agent(state: AgentState) -> Dict:
         "proposed_fix": fixed_code,
         "attempt_count": current_attempts,
         "target_file": target_file_path,
+        "last_diff": diff_summary,
         "history": state["history"] + [f"Applied fix v{current_attempts}"]
     }
 
@@ -148,10 +159,22 @@ def validation_agent(state: AgentState) -> Dict:
     
     target_file_path = state.get("target_file") or os.path.abspath(os.path.join(os.path.dirname(__file__), "../../target_app/app.py"))
     sandbox_output = run_in_sandbox(target_file_path)
-    
+    current_attempts = state.get("attempt_count", 1)
+    git_diff = state.get("last_diff", "")
+
     if sandbox_output["exit_code"] == 0:
         print("\n✅ [Validation Agent]: All tests passed in sandbox!")
         print(f"📊 [LOGS]:\n{sandbox_output['logs']}\n" + "-"*40)
+        
+        # Save successful execution to Database
+        log_patch_run(
+            target_file=os.path.basename(target_file_path),
+            attempt=current_attempts,
+            status="PASS",
+            git_diff=git_diff,
+            error_logs=sandbox_output['logs']
+        )
+        
         return {
             "test_result": "PASS",
             "history": state["history"] + ["Tests passed."]
@@ -160,6 +183,15 @@ def validation_agent(state: AgentState) -> Dict:
     logs = sandbox_output["logs"]
     print(f"❌ Sandbox execution failed with logs:\n{logs}\n" + "-"*40)
     
+    # Save failed execution to Database
+    log_patch_run(
+        target_file=os.path.basename(target_file_path),
+        attempt=current_attempts,
+        status="FAIL",
+        git_diff=git_diff,
+        error_logs=logs
+    )
+
     # Traceback file isolation
     discovered_file = target_file_path
     matches = re.findall(r'([\w-]+\.py):\d+', logs)
@@ -213,6 +245,7 @@ if __name__ == "__main__":
         "test_result": "Initial run required",
         "attempt_count": 0,
         "target_file": "",
+        "last_diff": "",
         "history": []
     }
     

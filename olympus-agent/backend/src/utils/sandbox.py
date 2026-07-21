@@ -1,12 +1,13 @@
 import subprocess
 import os
+from pathlib import Path
 
 def find_project_root(current_path: str, anchor: str = ".env") -> str:
-    dirname = os.path.abspath(current_path)
+    dirname = Path(current_path).resolve()
     while True:
-        if os.path.exists(os.path.join(dirname, anchor)):
-            return dirname
-        parent = os.path.dirname(dirname)
+        if (dirname / anchor).exists():
+            return dirname.as_posix()
+        parent = dirname.parent
         if parent == dirname:
             raise FileNotFoundError(f"Could not locate project root containing '{anchor}' anchor.")
         dirname = parent
@@ -18,21 +19,25 @@ def run_in_sandbox(target_file_path: str) -> dict:
     """
     try:
         root_dir = find_project_root(os.path.dirname(target_file_path))
-        target_dir = os.path.join(root_dir, "target_app")
+        target_dir = (Path(root_dir) / "backend" / "target_app").resolve()
+        
+        # Fallback if backend/target_app isn't found at the root level directly
+        if not target_dir.exists():
+            target_dir = (Path(root_dir) / "target_app").resolve()
+
+        clean_target_dir = target_dir.as_posix()
+
     except Exception as e:
         return {"exit_code": -1, "logs": f"Path Discovery Error: {str(e)}"}
 
-    # Convert Windows path to a format Docker CLI understands cleanly
-    clean_target_dir = target_dir.replace("\\", "/")
-
-    # Build native Docker CLI execution command
+    # Build native Docker CLI execution command with POSIX pathing and Pytest isolated cache
     docker_cmd = [
         "docker", "run", "--rm",
         "-v", f"{clean_target_dir}:/workspace",
         "-w", "/workspace",
         "-e", "PYTHONUNBUFFERED=1",
         "olympus-sandbox",
-        "pytest", "tests/", "--tb=short"
+        "pytest", "tests/", "--tb=short", "-o", "cache_dir=/tmp/.pytest_cache"
     ]
 
     try:
