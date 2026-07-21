@@ -9,8 +9,14 @@ from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 
 # Configure paths and load environment variables
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-load_dotenv(os.path.abspath(os.path.join(os.path.dirname(__file__), '../../../.env')))
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRC_DIR = os.path.abspath(os.path.join(CURRENT_DIR, '..'))
+PROJECT_ROOT = os.path.abspath(os.path.join(SRC_DIR, '../..'))
+
+if SRC_DIR not in sys.path:
+    sys.path.insert(0, SRC_DIR)
+
+load_dotenv(os.path.join(PROJECT_ROOT, '.env'))
 
 from utils.sandbox import run_in_sandbox 
 from utils.git_manager import init_fix_branch, generate_patch_diff, commit_patch
