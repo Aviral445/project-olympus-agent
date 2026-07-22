@@ -1,6 +1,13 @@
-.env
-.env.*
+# Python & Virtual Env
 venv/
 __pycache__/
 *.pyc
+
+# Local Databases & Vector Index Storage (Project Olympus Data)
+**/data/
+*.db
+*.sqlite3
+
+# Test caches & artifacts
 .pytest_cache/
+*.diff
